@@ -1,0 +1,290 @@
+diff --git a/Makefile.target b/Makefile.target
+index 5364555..a18122b 100644
+--- a/Makefile.target
++++ b/Makefile.target
+@@ -202,6 +202,8 @@ obj-$(CONFIG_USB_OHCI) += usb-ohci.o
+ obj-y += rtl8139.o
+ obj-y += e1000.o
+ 
++obj-y += vmsocket.o
++
+ # Inter-VM PCI shared memory
+ obj-$(CONFIG_KVM) += ivshmem.o
+ 
+diff --git a/hw/vmsocket.c b/hw/vmsocket.c
+new file mode 100644
+index 0000000..5a7c198
+--- /dev/null
++++ b/hw/vmsocket.c
+@@ -0,0 +1,271 @@
++/*
++ * vmsocket --VMSocket PCI Device.
++ *
++ * Copyright (C) 2009-2010  The University of Napoli Parthenope at Naples.
++ *
++ * This file is part of vmsocket.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ *
++ * Written by: Giuseppe Coviello <giuseppe.coviello@uniparthenope.it>,
++ *             Department of Applied Science
++ */
++
++#include "pci.h"
++
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++
++#define DEBUG_VMSOCKET
++
++#undef DEBUG_VMSOCKET
++
++#ifdef DEBUG_VMSOCKET
++#define VMSOCKET_DPRINTF(fmt, args...)        \
++    do {printf("VMSOCKET: " fmt, ##args); } while (0)
++#else
++#define VMSOCKET_DPRINTF(fmt, args...)
++#endif
++
++/* Registers */
++/* Read Only */
++#define VMSOCKET_CONNECT_L_REG  0x0
++#define VMSOCKET_READ_L_REG     0x20
++#define VMSOCKET_WRITE_L_REG    0x40
++#define VMSOCKET_FSYNC_L_REG    0x60
++#define VMSOCKET_CLOSE_L_REG    0x80
++
++/* Write Only */
++
++typedef struct VMSocketCtrl {
++    char path[1024];
++	uint32_t bytes_to_read;
++    uint32_t bytes_to_write;
++} VMSocketCtrl;
++
++typedef struct VMSocketState {
++     PCIDevice dev;
++
++     uint32_t regs_addr;
++
++     uint8_t *in_buffer;
++     ram_addr_t in_offset;
++     size_t in_size;
++
++     uint8_t *out_buffer;
++     ram_addr_t out_offset;
++     size_t out_size;
++
++     VMSocketCtrl *ctrl;
++     ram_addr_t ctrl_offset;
++     size_t ctrl_size;
++
++     int fd;
++    fd_set rfds;
++    struct timeval tv;
++} VMSocketState;
++
++static uint32_t vmsocket_connect(VMSocketState *s) 
++{
++    int len;
++    struct sockaddr_un remote;
++
++    VMSOCKET_DPRINTF("Trying to connect to: %s.\n", s->ctrl->path);
++    if ((s->fd = socket(AF_UNIX, SOCK_STREAM, 0)) == 0) {
++        s->fd = -1;     
++       return -1;
++    }
++    remote.sun_family = AF_UNIX;
++    strcpy(remote.sun_path, s->ctrl->path);
++    len = offsetof(struct sockaddr_un, sun_path) + strlen(remote.sun_path);
++    if (connect(s->fd, (struct sockaddr *) & remote, len) != 0) {  
++        s->fd = -1;
++        return -1;
++    }
++    s->tv.tv_sec = 1;
++    s->tv.tv_usec = 0;
++
++    return 0;
++}
++
++static uint32_t vmsocket_read(VMSocketState *s)
++{
++    if(s->fd == -1)
++        return -1;
++    FD_ZERO(&s->rfds);
++    FD_SET(s->fd, &s->rfds);
++    if(select(sizeof(s->rfds) * 8, &s->rfds, NULL, NULL, &s->tv) > 0)
++        return read(s->fd, s->in_buffer, s->ctrl->bytes_to_read);
++    return s->ctrl->bytes_to_read + 1;
++}
++
++static uint32_t vmsocket_write(VMSocketState *s)
++{
++    if(s->fd == -1)
++        return -1;
++    return write(s->fd, s->out_buffer, s->ctrl->bytes_to_write);
++}
++
++static uint32_t vmsocket_fsync(VMSocketState *s)
++{
++    if(s->fd == -1)
++        return -1;
++    VMSOCKET_DPRINTF("fsync\n");
++    return fsync(s->fd);
++}
++
++static uint32_t vmsocket_close(VMSocketState *s)
++{
++    if(s->fd != -1)
++        close(s->fd);
++    s->fd = -1;
++    return 0;
++}
++
++static uint32_t vmsocket_regs_readl(void *opaque, target_phys_addr_t addr) {
++    VMSocketState * s = opaque;
++    switch (addr & 0xFF) {
++        case VMSOCKET_CONNECT_L_REG:
++            return vmsocket_connect(s);
++        case VMSOCKET_READ_L_REG:
++            return vmsocket_read(s);
++        case VMSOCKET_WRITE_L_REG:
++            return vmsocket_write(s);
++        case VMSOCKET_FSYNC_L_REG:
++            return vmsocket_fsync(s);
++        case VMSOCKET_CLOSE_L_REG:
++            return vmsocket_close(s);
++    }
++    VMSOCKET_DPRINTF("reading long from invalid register 0x%x.\n", 
++		   (uint32_t) addr & 0xFF);
++    return 0;
++}
++
++static CPUReadMemoryFunc *vmsocket_regs_read[3] = {
++     NULL,
++     NULL,
++     vmsocket_regs_readl,
++};
++
++static CPUWriteMemoryFunc *vmsocket_regs_write[3] = {
++     NULL,
++     NULL,
++     NULL
++};
++
++static void vmsocket_region_map(PCIDevice *pci_dev, int region_num, 
++			     pcibus_t addr, pcibus_t size, int type) {
++     VMSocketState *s = DO_UPCAST(VMSocketState, dev, pci_dev);
++	
++     switch(region_num) {
++     case 0: 
++	  VMSOCKET_DPRINTF("Register regs at 0x%x.\n", (unsigned) addr);
++	  cpu_register_physical_memory(addr, 0x100, s->regs_addr);
++	  break;
++     case 1:
++	  VMSOCKET_DPRINTF("Register input buffer at 0x%x.\n", 
++			(unsigned) addr);
++	  cpu_register_physical_memory(addr, s->in_size, 
++				       s->in_offset);
++	  break;
++     case 2:
++	  VMSOCKET_DPRINTF("Register output buffer at 0x%x.\n", 
++			(unsigned) addr);
++	  cpu_register_physical_memory(addr, s->out_size, 
++				       s->out_offset);
++	  break;
++     case 3:
++	  VMSOCKET_DPRINTF("Registre ctrl at 0x%x.\n", 
++			(unsigned) addr);
++	  cpu_register_physical_memory(addr, s->ctrl_size, 
++				       s->ctrl_offset);
++	  break;
++     }
++}
++
++static void vmsocket_reset(DeviceState *d) {
++}
++
++static int pci_vmsocket_init(PCIDevice *dev) {
++     VMSocketState *s = DO_UPCAST(VMSocketState, dev, dev);
++     uint8_t *pci_conf;
++     
++     VMSOCKET_DPRINTF("Enabled!\n");
++     
++     /* Registers */
++     s->regs_addr = cpu_register_io_memory(vmsocket_regs_read,
++					   vmsocket_regs_write, s);
++
++     /* I/O Buffers */
++     s->in_size = 1024 * 1024; /* FIXME: make it configurable */
++     s->in_offset = 0;
++     s->in_offset = qemu_ram_alloc(&s->dev.qdev, "vmsocket.in_buffer", s->in_size);
++     s->in_buffer = qemu_get_ram_ptr(s->in_offset);
++     
++     s->out_size = 1024 * 1024; /* FIXME: make it configurable */
++     s->out_offset = 0;
++     s->out_offset = qemu_ram_alloc(&s->dev.qdev, "vmsocket.out_buffer", s->out_size);
++     s->out_buffer = qemu_get_ram_ptr(s->out_offset);
++
++     s->ctrl_size = 4 * 1024; //sizeof(VMSocketCtrl);
++     s->ctrl_offset = qemu_ram_alloc(&s->dev.qdev, "vmsocket.ctrl", 
++				       s->ctrl_size);
++     s->ctrl = qemu_get_ram_ptr(s->ctrl_offset);
++
++     /* PCI config */
++     pci_conf = s->dev.config;
++     pci_config_set_vendor_id(pci_conf, PCI_VENDOR_ID_REDHAT_QUMRANET);
++     pci_config_set_device_id(pci_conf, 0x6662);
++     pci_config_set_class(pci_conf, PCI_CLASS_OTHERS);
++     pci_conf[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL;
++     pci_conf[PCI_INTERRUPT_PIN] = 0;
++
++     /* Regions */
++     pci_register_bar(&s->dev, 0, 0x100, PCI_BASE_ADDRESS_SPACE_MEMORY, 
++		      vmsocket_region_map);
++     pci_register_bar(&s->dev, 1, s->in_size, PCI_BASE_ADDRESS_SPACE_MEMORY,
++		      vmsocket_region_map);
++     pci_register_bar(&s->dev, 2, s->out_size, PCI_BASE_ADDRESS_SPACE_MEMORY,
++		      vmsocket_region_map);
++     pci_register_bar(&s->dev, 3, s->ctrl_size,
++              PCI_BASE_ADDRESS_SPACE_MEMORY, vmsocket_region_map);
++
++     s->fd = -1;
++     return 0;
++}
++
++static int pci_vmsocket_uninit(PCIDevice *dev) {
++     return 0;
++}
++
++static PCIDeviceInfo vmsocket_info = {
++    .qdev.name  = "vmsocket",
++    .qdev.size  = sizeof(VMSocketState),
++    .qdev.reset = vmsocket_reset,
++    .init       = pci_vmsocket_init,
++    .exit       = pci_vmsocket_uninit,
++    .qdev.props = (Property[]) {
++        DEFINE_PROP_END_OF_LIST(),
++    }
++};
++
++static void vmsocket_register_devices(void)
++{
++    pci_qdev_register(&vmsocket_info);
++}
++
++device_init(vmsocket_register_devices)
++
